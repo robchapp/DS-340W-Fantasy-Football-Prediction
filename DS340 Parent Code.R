@@ -1,6 +1,6 @@
 require(forecast)
 # Read offense Table
-offense <- read.csv("Clean_offense.csv", header=TRUE)
+offense <- read.csv("cleaned_fantasy_football_data.xlsx", header=TRUE)
 
 players <- read.csv("Clean_players.csv", header=TRUE)
 
