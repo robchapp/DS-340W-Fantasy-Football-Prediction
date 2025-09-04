@@ -1,8 +1,22 @@
 require(forecast)
-# Read offense Table
-offense <- read.csv("cleaned_fantasy_football_data.xlsx", header=TRUE)
+require(nflfastR)
 
-players <- read.csv("Clean_players.csv", header=TRUE)
+
+#Define range: from first season with modern stats to the latest available season
+start_season <- 1999
+end_season   <- nflreadr::most_recent_season()
+
+#Load EVERY season's offensive player stats into one data frame
+offense <- nflreadr::load_player_stats(
+  seasons   = start_season:end_season,
+  stat_type = "offense"           #options include "offense", "defense", "kicking", "returns"
+)
+
+#All seasons, from 1999 through the most recent
+team_stats <- calculate_team_stats(seasons = 1999:most_recent_season())
+
+
+players <- read.csv("cleaned_fantasy_football_data.xlsx", header=TRUE) #Could change to nflfastR data if decide to go that direction with data source
 
 #Table of forecasted values for each offensive metric for each player
 nFactors <- 13
