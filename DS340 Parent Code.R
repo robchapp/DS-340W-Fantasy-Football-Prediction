@@ -1,3 +1,8 @@
+install.packages(c("forecast","nflfastR","nflreadr"))
+library(forecast)
+library(nflfastR)
+library(nflreadr)
+
 require(forecast)
 require(nflfastR)
 
@@ -6,7 +11,8 @@ require(nflfastR)
 # Columns are arranged so that metric 1 starts at column 8 (so [[7+factor]] works unchanged)
 # --------------------
 start_season <- 1999
-end_season   <- nflreadr::most_recent_season()
+end_season   <- nflreadr::most_recent_season() - 1   # <- 2024 for today
+
 
 off_raw <- nflreadr::load_player_stats(
   seasons   = start_season:end_season,
