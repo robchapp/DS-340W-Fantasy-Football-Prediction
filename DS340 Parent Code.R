@@ -1,31 +1,46 @@
-install.packages(c("forecast","nflfastR","nflreadr"))
-library(forecast)
-library(nflfastR)
-library(nflreadr)
+# ─────────────────────────────────────────────
+# Packages
+# ─────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(forecast)
+  library(nflfastR)
+  library(nflreadr)
+})
 
-require(forecast)
-require(nflfastR)
-
-# --------------------
-# NEW: build "offense" (player-week offense) from nflreadr/nflfastR
-# Columns are arranged so that metric 1 starts at column 8 (so [[7+factor]] works unchanged)
-# --------------------
+# ─────────────────────────────────────────────
+# Seasons
+# ─────────────────────────────────────────────
 start_season <- 1999
-end_season   <- nflreadr::most_recent_season() - 1   # <- 2024 for today
+end_season   <- nflreadr::most_recent_season() - 1
 
+# ─────────────────────────────────────────────
+# Helper: replacement for calculate_team_stats()
+# ─────────────────────────────────────────────
+calculate_team_stats <- function(seasons) {
+  off_raw <- nflreadr::load_player_stats(seasons = seasons)
+  team_col <- if ("recent_team" %in% names(off_raw)) "recent_team" else if ("team" %in% names(off_raw)) "team" else NA
+  if (is.na(team_col)) stop("No team column found")
+  
+  num_cols <- intersect(
+    c("passing_yards","rushing_yards","receiving_yards",
+      "passing_tds","rushing_tds","receiving_tds",
+      "interceptions","fumbles_lost"),
+    names(off_raw)
+  )
+  aggregate(
+    off_raw[num_cols],
+    by = list(team = off_raw[[team_col]], season = off_raw[["season"]]),
+    FUN = sum, na.rm = TRUE
+  )
+}
 
-off_raw <- nflreadr::load_player_stats(
-  seasons   = start_season:end_season,
-  stat_type = "offense"
-)
-
-# Normalize expected columns
+# ─────────────────────────────────────────────
+# OFFENSE
+# ─────────────────────────────────────────────
+off_raw <- nflreadr::load_player_stats(seasons = start_season:end_season)
 player_col <- if ("player_name" %in% names(off_raw)) "player_name" else if ("player" %in% names(off_raw)) "player" else "name"
 team_col   <- if ("recent_team" %in% names(off_raw)) "recent_team" else if ("team" %in% names(off_raw)) "team" else NA
 
-# Build offense with EXACT index alignment:
-# cols 1..7: non-metric placeholders + keys
-# cols 8..20: the 13 metrics in your order: pa, pc, py, ints, tdp, ra, ry, tdr, trg, rec, recy, tdrec, fum
 offense <- transform(
   data.frame(
     player    = off_raw[[player_col]],
@@ -33,259 +48,161 @@ offense <- transform(
     POS       = if ("position" %in% names(off_raw)) off_raw[["position"]] else NA_character_,
     GAME.seas = off_raw[["season"]],
     GAME.wk   = off_raw[["week"]],
-    C5        = NA_real_,  # filler to keep pa at column 8
-    C6        = NA_real_,  # filler to keep pa at column 8
-
-    # metrics (keep order!)
-    pa    = if ("attempts"           %in% names(off_raw)) off_raw[["attempts"]]            else if ("passing_attempts"   %in% names(off_raw)) off_raw[["passing_attempts"]]   else 0,
-    pc    = if ("completions"        %in% names(off_raw)) off_raw[["completions"]]         else if ("passing_completions"%in% names(off_raw)) off_raw[["passing_completions"]] else 0,
-    py    = if ("passing_yards"      %in% names(off_raw)) off_raw[["passing_yards"]]       else if ("pass_yards"         %in% names(off_raw)) off_raw[["pass_yards"]]          else 0,
-    ints  = if ("interceptions"      %in% names(off_raw)) off_raw[["interceptions"]]       else if ("int"                %in% names(off_raw)) off_raw[["int"]]                 else 0,
-    tdp   = if ("passing_tds"        %in% names(off_raw)) off_raw[["passing_tds"]]         else if ("pass_td"            %in% names(off_raw)) off_raw[["pass_td"]]             else 0,
-    ra    = if ("carries"            %in% names(off_raw)) off_raw[["carries"]]             else if ("rushing_attempts"   %in% names(off_raw)) off_raw[["rushing_attempts"]]    else 0,
-    ry    = if ("rushing_yards"      %in% names(off_raw)) off_raw[["rushing_yards"]]       else if ("rush_yards"         %in% names(off_raw)) off_raw[["rush_yards"]]          else 0,
-    tdr   = if ("rushing_tds"        %in% names(off_raw)) off_raw[["rushing_tds"]]         else if ("rush_td"            %in% names(off_raw)) off_raw[["rush_td"]]             else 0,
-    trg   = if ("targets"            %in% names(off_raw)) off_raw[["targets"]]             else if ("receive_targets"    %in% names(off_raw)) off_raw[["receive_targets"]]     else 0,
-    rec   = if ("receptions"         %in% names(off_raw)) off_raw[["receptions"]]          else if ("receive_receptions" %in% names(off_raw)) off_raw[["receive_receptions"]]  else 0,
-    recy  = if ("receiving_yards"    %in% names(off_raw)) off_raw[["receiving_yards"]]     else if ("receive_yards"      %in% names(off_raw)) off_raw[["receive_yards"]]       else 0,
-    tdrec = if ("receiving_tds"      %in% names(off_raw)) off_raw[["receiving_tds"]]       else if ("receive_td"         %in% names(off_raw)) off_raw[["receive_td"]]          else 0,
-    fum   = if ("fumbles_lost"       %in% names(off_raw)) off_raw[["fumbles_lost"]]        else if ("fumbles"            %in% names(off_raw)) off_raw[["fumbles"]]             else 0
+    C5        = NA_real_, C6 = NA_real_,
+    pa    = off_raw[["passing_attempts"]]   %||% off_raw[["attempts"]]    %||% 0,
+    pc    = off_raw[["passing_completions"]] %||% off_raw[["completions"]] %||% 0,
+    py    = off_raw[["passing_yards"]]      %||% off_raw[["pass_yards"]]  %||% 0,
+    ints  = off_raw[["interceptions"]]      %||% off_raw[["int"]]         %||% 0,
+    tdp   = off_raw[["passing_tds"]]        %||% off_raw[["pass_td"]]     %||% 0,
+    ra    = off_raw[["rushing_attempts"]]   %||% off_raw[["carries"]]     %||% 0,
+    ry    = off_raw[["rushing_yards"]]      %||% off_raw[["rush_yards"]]  %||% 0,
+    tdr   = off_raw[["rushing_tds"]]        %||% off_raw[["rush_td"]]     %||% 0,
+    trg   = off_raw[["targets"]]            %||% off_raw[["receive_targets"]]    %||% 0,
+    rec   = off_raw[["receptions"]]         %||% off_raw[["receive_receptions"]] %||% 0,
+    recy  = off_raw[["receiving_yards"]]    %||% off_raw[["receive_yards"]]      %||% 0,
+    tdrec = off_raw[["receiving_tds"]]      %||% off_raw[["receive_td"]]         %||% 0,
+    fum   = off_raw[["fumbles_lost"]]       %||% off_raw[["fumbles"]]            %||% 0
   ),
   stringsAsFactors = FALSE
 )
 
-# Keep your team summaries (unchanged)
-team_stats <- calculate_team_stats(seasons = 1999:most_recent_season())
+`%||%` <- function(x,y) if (!is.null(x)) x else y
 
-# --------------------
-# NEW: replace players CSV with names from offense
-# Expectation: first column is the player ID string, as your code uses players[player,1]
-# --------------------
-players <- data.frame(player = unique(offense$player), check.names = FALSE, stringsAsFactors = FALSE)
+players_off <- data.frame(player = unique(offense$player))
+nPlayers_off <- nrow(players_off)
 
-# ======================================================================
-# FROM HERE DOWN your original OFFENSE block stays the same
-# ======================================================================
+Forecast_offense <- as.data.frame(matrix(0, nrow = nPlayers_off, ncol = 15))
+colnames(Forecast_offense) <- c("player","pa","pc","py","ints","tdp","ra","ry","tdr","trg","rec","recy","tdrec","fum","FF")
+Forecast_offense$player <- as.character(players_off$player)
 
-#Table of forecasted values for each offensive metric for each player
-nFactors <- 13
-nPlayers <- 409
-Forecast_offense <- matrix(0, nrow = nPlayers, ncol = nFactors+2)
-colnames(Forecast_offense) <- c("player", "pa", "pc","py","ints","tdp","ra","ry","tdr","trg","rec","recy","tdrec","fum","FF")
-
-FF_weights <- c(0.0,0.0,0.0,-2.4,0.0,6.0,0.1,0.1,6.0,0.0,0.1,0.1,6.0,-2)
-
-for (player in 1:nPlayers) {
-  
-  #Filtering by each individual player and sorting by season and week
-  playerID <- as.character(players[player,1])
-  Forecast_offense[player,1] <- playerID
-  
-  player_data <- subset(offense, offense$player == playerID) #CHANGE
-  sort_player_data <- player_data[order(player_data$GAME.seas,player_data$GAME.wk),]
-  
-  for (factor in 1:nFactors) {
-    
-    #fitting the best ARIMA model for the given scoring metric
-    ARIMAfilt <- auto.arima(sort_player_data[[7+factor]]) #CHANGE TO DOUBLE BRACKET COLUMN NUMBER
-    pred <- forecast(ARIMAfilt,h=16) #using the best ARIMA model to predict values for the given offensive metric out 16 periods
-    pred$mean
-    Forecast_offense[player,1+factor] <- sum(pred$mean)
-  }
-  
-  #add line of code to calculate FF score for each player and write it in column 15 of the table (have to add another column to table in line 11)
-  player_factors <- as.double(Forecast_offense[player,2:(nFactors+1)])
-  FF <- crossprod(FF_weights,player_factors)
-  Forecast_offense[player,nFactors+2] <- FF
-}
-
-#add line of code to save "forecast_offense" into a CSV file, should call it the same as the table here
-write.csv(Forecast_offense,"forecast_offense.csv")
-
-
-
-# =========================
-# KICKERS
-# =========================
-require(forecast)
-
-# --------------------
-# NEW: build "kicking" from nflreadr; shape so metric 1 starts at col 7 (so [[6+factor]] works)
-# --------------------
-kick_raw <- nflreadr::load_player_stats(
-  seasons   = start_season:end_season,
-  stat_type = "kicking"
+# Named weights (13 metrics)
+FF_weights_off <- c(
+  pa=0.0, pc=0.0, py=0.0, ints=-2.4, tdp=0.0,
+  ra=6.0, ry=0.1, tdr=0.1, trg=6.0, rec=0.0,
+  recy=0.1, tdrec=0.1, fum=-2.0
 )
 
+off_metric_cols <- names(FF_weights_off)
+
+for (i in seq_len(nPlayers_off)) {
+  playerID <- Forecast_offense$player[i]
+  pdata <- subset(offense, player == playerID)
+  if (nrow(pdata) == 0) next
+  pdata <- pdata[order(pdata$GAME.seas,pdata$GAME.wk),]
+  
+  for (j in seq_along(off_metric_cols)) {
+    series <- as.numeric(pdata[[off_metric_cols[j]]])
+    series <- series[is.finite(series)]
+    if (length(series) >= 2 && any(series != series[1])) {
+      fit <- auto.arima(series)
+      pred <- forecast(fit,h=16)
+      Forecast_offense[i, off_metric_cols[j]] <- sum(pred$mean)
+    } else {
+      Forecast_offense[i, off_metric_cols[j]] <- 0
+    }
+  }
+  vals <- as.numeric(Forecast_offense[i, off_metric_cols])
+  Forecast_offense$FF[i] <- sum(vals * FF_weights_off[off_metric_cols], na.rm=TRUE)
+}
+write.csv(Forecast_offense,"forecast_offense.csv",row.names=FALSE)
+
+# ─────────────────────────────────────────────
+# KICKERS
+# ─────────────────────────────────────────────
+kick_raw <- nflreadr::load_player_stats(seasons=start_season:end_season)
 k_player_col <- if ("player_name" %in% names(kick_raw)) "player_name" else if ("player" %in% names(kick_raw)) "player" else "name"
 
 kicking <- data.frame(
   player    = kick_raw[[k_player_col]],
-  TEAM      = if ("recent_team" %in% names(kick_raw)) kick_raw[["recent_team"]] else if ("team" %in% names(kick_raw)) kick_raw[["team"]] else NA_character_,
+  TEAM      = kick_raw[["recent_team"]] %||% kick_raw[["team"]],
   GAME.seas = kick_raw[["season"]],
   GAME.wk   = kick_raw[["week"]],
-  C5        = NA_real_,   # filler so that PAT is column 7
-  C6        = NA_real_,   # filler so that PAT is column 7
-  PAT = if ("extra_points_made"   %in% names(kick_raw)) kick_raw[["extra_points_made"]]   else if ("xpm" %in% names(kick_raw)) kick_raw[["xpm"]] else 0,
-  FGS = if ("field_goals_made"    %in% names(kick_raw)) kick_raw[["field_goals_made"]]    else if ("fgm" %in% names(kick_raw)) kick_raw[["fgm"]] else 0,
-  FGM = if ("field_goals_made"    %in% names(kick_raw)) kick_raw[["field_goals_made"]]    else if ("fgm" %in% names(kick_raw)) kick_raw[["fgm"]] else 0,
-  FGL = if ("field_goals_longest" %in% names(kick_raw)) kick_raw[["field_goals_longest"]] else if ("fg_long" %in% names(kick_raw)) kick_raw[["fg_long"]] else 0,
-  check.names = FALSE,
-  stringsAsFactors = FALSE
+  C5=NA_real_, C6=NA_real_,
+  PAT = kick_raw[["extra_points_made"]] %||% kick_raw[["xpm"]] %||% 0,
+  FGS = kick_raw[["field_goals_made"]]  %||% kick_raw[["fgm"]] %||% 0,
+  FGM = kick_raw[["field_goals_made"]]  %||% kick_raw[["fgm"]] %||% 0,
+  FGL = kick_raw[["field_goals_longest"]] %||% kick_raw[["fg_long"]] %||% 0
 )
 
-# --------------------
-# NEW: replace kickers CSV with names from kicking
-# --------------------
-players <- data.frame(player = unique(kicking$player), check.names = FALSE, stringsAsFactors = FALSE)
+players_k <- data.frame(player=unique(kicking$player))
+nPlayers_k <- nrow(players_k)
 
-# (UNCHANGED) Your original kicker block
-nFactors <- 4
-nPlayers <- 37
-Forecast_kickers <- matrix(0, nrow = nPlayers, ncol = nFactors+2)
+Forecast_kickers <- as.data.frame(matrix(0,nrow=nPlayers_k,ncol=6))
 colnames(Forecast_kickers) <- c("player","PAT","FGS","FGM","FGL","FFP")
+Forecast_kickers$player <- as.character(players_k$player)
 
-FF_weights <- c(1,3,4,5)
+FF_weights_k <- c(PAT=1,FGS=3,FGM=4,FGL=5)
 
-for (player in 1:nPlayers) {
+for (i in seq_len(nPlayers_k)) {
+  playerID <- Forecast_kickers$player[i]
+  pdata <- subset(kicking, player==playerID)
+  if (nrow(pdata)==0) next
+  pdata <- pdata[order(pdata$GAME.seas,pdata$GAME.wk),]
   
-  #Filtering by each individual player and sorting by season and week
-  playerID <- as.character(players[player,1])
-  Forecast_kickers[player,1] <- playerID
-  
-  player_data <- subset(kicking,player == playerID) #CHANGE
-  sort_player_data <- player_data[order(player_data$GAME.seas,player_data$GAME.wk),]
-  
-  for (factor in 1:nFactors) {
-    
-    #fitting the best ARIMA model for the given scoring metric
-    ARIMAfilt <- auto.arima(sort_player_data[[6+factor]])
-    pred <- forecast(ARIMAfilt,h=16) #using the best ARIMA model to predict values for the given kicking metric out 16 periods
-    pred$mean
-    Forecast_kickers[player,1+factor] <- sum(pred$mean)
+  for (j in names(FF_weights_k)) {
+    series <- as.numeric(pdata[[j]])
+    series <- series[is.finite(series)]
+    if (length(series)>=2 && any(series!=series[1])) {
+      fit <- auto.arima(series); pred <- forecast(fit,h=16)
+      Forecast_kickers[i,j] <- sum(pred$mean)
+    } else Forecast_kickers[i,j] <- 0
   }
-  
-  #add line of code to calculate FF score for each player and write it in the table (have to add another column to table in line 11)
-  player_factors <- as.double(Forecast_kickers[player,2:(nFactors+1)])
-  FF <- crossprod(FF_weights,player_factors)
-  Forecast_kickers[player,nFactors+2] <- FF
+  vals <- as.numeric(Forecast_kickers[i,names(FF_weights_k)])
+  Forecast_kickers$FFP[i] <- sum(vals*FF_weights_k,na.rm=TRUE)
 }
+write.csv(Forecast_kickers,"forecast_kickers.csv",row.names=FALSE)
 
-#add line of code to save "forecast_kickers" into a CSV file, should call it the same as the table here
-write.csv(Forecast_kickers,"forecast_kickers.csv")
-
-
-
-# =========================
+# ─────────────────────────────────────────────
 # DEFENSE
-# =========================
-require(forecast)
-
-# --------------------
-# NEW: build team-week defensive fantasy points proxy from play-by-play, then shape to expected columns
-# We keep a single metric in column 4 (so [[3+factor]] works with nFactors=1)
-# --------------------
+# ─────────────────────────────────────────────
 pbp <- nflfastR::load_pbp(start_season:end_season)
-
-# Simple DST-point proxy (edit if needed)
 dst_weekly <- aggregate(
-  list(dst_pts = ifelse(pbp$defteam == pbp$return_team & pbp$touchdown == 1, 6, 0) +
-                 ifelse(!is.na(pbp$sack) & pbp$sack == 1, 1, 0) +
-                 ifelse(!is.na(pbp$interception) & pbp$interception == 1, 2, 0) +
-                 ifelse(!is.na(pbp$fumble_forced) & pbp$fumble_forced == 1, 2, 0)
-  ),
-  by = list(team = pbp$defteam, GAME.seas = pbp$season, GAME.wk = pbp$week),
-  FUN = sum, na.rm = TRUE
+  list(dst_pts =
+         ifelse(pbp$defteam==pbp$return_team & pbp$touchdown==1,6,0)+
+         ifelse(pbp$sack==1,1,0)+
+         ifelse(pbp$interception==1,2,0)+
+         ifelse(pbp$fumble_forced==1,2,0)),
+  by=list(team=pbp$defteam,GAME.seas=pbp$season,GAME.wk=pbp$week),
+  FUN=sum,na.rm=TRUE
 )
 
-# Defense table with expected columns
-defense <- data.frame(
-  team      = dst_weekly$team,
-  GAME.seas = dst_weekly$GAME.seas,
-  GAME.wk   = dst_weekly$GAME.wk,
-  DEFPTS    = dst_weekly$dst_pts,
-  check.names = FALSE,
-  stringsAsFactors = FALSE
-)
+defense <- data.frame(team=dst_weekly$team,GAME.seas=dst_weekly$GAME.seas,
+                      GAME.wk=dst_weekly$GAME.wk,DEFPTS=dst_weekly$dst_pts)
 
-# --------------------
-# NEW: replace teams CSV with list from defense
-# --------------------
-players <- data.frame(Team = sort(unique(defense$team)), check.names = FALSE, stringsAsFactors = FALSE)
+teams_df <- data.frame(Team=sort(unique(defense$team)))
+nTeams <- nrow(teams_df)
 
-# (UNCHANGED) Your original defense block
-nFactors <- 1
-nTeams <- 32
-Forecast_defense <- matrix(0, nrow=nTeams, ncol = nFactors+2)
+Forecast_defense <- as.data.frame(matrix(0,nrow=nTeams,ncol=2))
 colnames(Forecast_defense) <- c("Team","DEF Fant. Pts.")
+Forecast_defense$Team <- as.character(teams_df$Team)
 
-FF_weights <- c(1.0)
-
-for (team in 1:nTeams) {
-  
-  #Filtering by each individual team and sorting by season and week
-  this_team <- as.character(players[team,1])
-  Forecast_defense[team,1] <- this_team
-  
-  player_data <- subset(defense,team == this_team) #CHANGE
-  sort_player_data <- player_data[order(player_data$GAME.seas,player_data$GAME.wk),]
-  
-  for (factor in 1:nFactors) {
-    
-    #fitting the best ARIMA model for the given scoring metric
-    ARIMAfilt <- auto.arima(sort_player_data[[3+factor]])
-    pred <- forecast(ARIMAfilt,h=16) #using the best ARIMA model to predict values for the given defensive points out 16 periods
-    pred$mean
-    Forecast_defense[team,1+factor] <- sum(pred$mean)
-  }
-  
-  #add line of code to calculate FF score for each player and write it in the table (have to add another column to table in line 11)
-  player_factors <- as.double(Forecast_defense[team,2:(nFactors+1)])
-  FF <- crossprod(FF_weights,player_factors)
-  Forecast_defense[team,nFactors+2] <- FF
+for (i in seq_len(nTeams)) {
+  tm <- Forecast_defense$Team[i]
+  pdata <- subset(defense,team==tm)
+  if (nrow(pdata)==0) next
+  pdata <- pdata[order(pdata$GAME.seas,pdata$GAME.wk),]
+  series <- as.numeric(pdata$DEFPTS); series <- series[is.finite(series)]
+  if (length(series)>=2 && any(series!=series[1])) {
+    fit<-auto.arima(series); pred<-forecast(fit,h=16)
+    Forecast_defense[i,"DEF Fant. Pts."] <- sum(pred$mean)
+  } else Forecast_defense[i,"DEF Fant. Pts."] <- 0
 }
+write.csv(Forecast_defense,"forecast_defense.csv",row.names=FALSE)
 
-#add line of code to save "forecast_defense" into a CSV file, should call it the same as the table here
-write.csv(Forecast_defense,"forecast_defense.csv")
-
-
-
-# =========================
+# ─────────────────────────────────────────────
 # TEST 2007 (OFFENSE)
-# =========================
-require(forecast)
+# ─────────────────────────────────────────────
+offense_2007 <- subset(offense,GAME.seas==2007)
+players_2007 <- data.frame(player=sort(unique(offense_2007$player)))
+nPlayers_t <- nrow(players_2007)
 
-# --------------------
-# NEW: replace 2007 test CSVs with filtered offense + derived players
-# Keep the same object names used in your block
-# --------------------
-offense <- subset(offense, GAME.seas == 2007)
-players <- data.frame(player = sort(unique(offense$player)), check.names = FALSE, stringsAsFactors = FALSE)
+Forecast_offense_Test <- as.data.frame(matrix(0,nrow=nPlayers_t,ncol=15))
+colnames(Forecast_offense_Test) <- colnames(Forecast_offense)
 
-# (UNCHANGED) Your original Test block
-nFactors <- 13
-nPlayers <- 409
-Forecast_offense_Test <- matrix(0, nrow = nPlayers, ncol = nFactors+2)
-colnames(Forecast_offense_Test) <- c("player", "pa", "pc","py","ints","tdp","ra","ry","tdr","trg","rec","recy","tdrec","fum","FF")
-
-FF_weights <- c(0.0,0.0,0.0,-2.4,0.0,6.0,0.1,0.1,6.0,0.0,0.1,0.1,6.0,-2)
-
-for (player in 1:nPlayers) {
-  
-  #Filtering by each individual player and sorting by season and week
-  playerID <- as.character(players[player,1])
-  Forecast_offense_Test[player,1] <- playerID
-  
-  player_data <- subset(offense, offense$player == playerID) #CHANGE
-  sort_player_data <- player_data[order(player_data$GAME.seas,player_data$GAME.wk),]
-  
-  # (keeping your commented-out forecast section as-is)
-
-  #add line of code to calculate FF score for each player and write it in column 15 of the table (have to add another column to table in line 11)
-  player_factors <- as.double(Forecast_offense_Test[player,2:(nFactors+1)])
-  FF <- crossprod(FF_weights,player_factors)
-  Forecast_offense_Test[player,nFactors+2] <- FF
+Forecast_offense_Test$player <- as.character(players_2007$player)
+for (i in seq_len(nPlayers_t)) {
+  playerID <- Forecast_offense_Test$player[i]
+  vals <- as.numeric(Forecast_offense_Test[i,off_metric_cols])
+  Forecast_offense_Test$FF[i] <- sum(vals*FF_weights_off[off_metric_cols],na.rm=TRUE)
 }
-
-#add line of code to save "forecast_offense" into a CSV file, should call it the same as the table here
-write.csv(Forecast_offense_Test,"forecast_offense_Test2007.csv")
+write.csv(Forecast_offense_Test,"forecast_offense_Test2007.csv",row.names=FALSE)
