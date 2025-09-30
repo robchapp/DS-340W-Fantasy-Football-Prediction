@@ -15,6 +15,11 @@ ARIMA_STEPWISE    <- TRUE
 ARIMA_SEASONAL    <- FALSE
 ARIMA_MAX_ORDER   <- 5
 
+# Train/Test/Unseen knobs
+HOLDOUT_WEEKS     <- 6   # last K obs per series → test
+UNSEEN_H          <- 8   # forecast horizon beyond the full series
+MIN_TRAIN_N       <- 8   # need at least this many points to fit
+
 # ─────────────────────────────────────────────
 # Packages
 # ─────────────────────────────────────────────
@@ -245,6 +250,186 @@ for (i in seq_len(nTeams)) {
 write.csv(Forecast_defense, "forecast_defense.csv", row.names = FALSE)
 
 # ─────────────────────────────────────────────
+# TRAIN / TEST / UNSEEN SPLIT + EVALUATION
+# (works on offense, kickers, defense)
+# ─────────────────────────────────────────────
+
+# Fit helper returning both test and unseen forecasts
+.fit_eval_one <- function(x, holdout_k = HOLDOUT_WEEKS, unseen_h = UNSEEN_H) {
+  x <- as.numeric(x); x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < MIN_TRAIN_N) {
+    return(list(n_train=0, n_test=0, test_pred=numeric(0), test_true=numeric(0), unseen_pred=numeric(0)))
+  }
+  k <- min(holdout_k, floor(n/3))   # keep enough train length
+  if (k < 1) {
+    return(list(n_train=n, n_test=0, test_pred=numeric(0), test_true=numeric(0), unseen_pred=numeric(0)))
+  }
+  train <- x[seq_len(n-k)]
+  test  <- x[(n-k+1):n]
+  
+  if (length(unique(train)) <= 1) {
+    mu <- mean(train)
+    return(list(n_train=length(train), n_test=length(test),
+                test_pred=rep(mu, length(test)),
+                test_true=test,
+                unseen_pred=rep(mu, unseen_h)))
+  }
+  
+  fit <- forecast::auto.arima(
+    train,
+    approximation = ARIMA_APPROX,
+    stepwise      = ARIMA_STEPWISE,
+    seasonal      = ARIMA_SEASONAL,
+    max.order     = ARIMA_MAX_ORDER
+  )
+  # test forecast
+  fc_test   <- forecast::forecast(fit, h = length(test))$mean
+  # unseen forecast beyond full series end
+  fit_full  <- tryCatch(forecast::auto.arima(
+    x,
+    approximation = ARIMA_APPROX,
+    stepwise      = ARIMA_STEPWISE,
+    seasonal      = ARIMA_SEASONAL,
+    max.order     = ARIMA_MAX_ORDER
+  ),
+  error = function(e) fit)
+  fc_unseen <- as.numeric(forecast::forecast(fit_full, h = unseen_h)$mean)
+  
+  list(n_train=length(train), n_test=length(test),
+       test_pred=as.numeric(fc_test), test_true=test,
+       unseen_pred=fc_unseen)
+}
+
+.rmse <- function(truth, pred) {
+  if (!length(truth) || !length(pred)) return(NA_real_)
+  sqrt(mean((truth - pred)^2, na.rm=TRUE))
+}
+.mape <- function(truth, pred) {
+  if (!length(truth) || !length(pred)) return(NA_real_)
+  idx <- which(is.finite(truth) & is.finite(pred) & abs(truth) > 1e-9)
+  if (!length(idx)) return(NA_real_)
+  mean(abs((truth[idx] - pred[idx]) / truth[idx])) * 100
+}
+
+# Generic evaluator over a table with keys (id, season, week) and metric columns
+.evaluate_block <- function(df, id_col, season_col, week_col, metric_cols) {
+  metric_cols <- intersect(metric_cols, names(df))
+  if (!length(metric_cols)) stop("No metric columns found in data frame.")
+  
+  df <- df[order(df[[id_col]], df[[season_col]], df[[week_col]]), ]
+  ids <- unique(df[[id_col]])
+  out <- vector("list", length(ids) * length(metric_cols))
+  idx <- 1L
+  
+  for (idv in ids) {
+    sub <- df[df[[id_col]] == idv, c(season_col, week_col, metric_cols), drop = FALSE]
+    for (m in metric_cols) {
+      res  <- .fit_eval_one(sub[[m]])
+      rmse <- .rmse(res$test_true, res$test_pred)
+      mape <- .mape(res$test_true, res$test_pred)
+      out[[idx]] <- data.frame(
+        id   = idv,
+        metric = m,
+        n_train = res$n_train,
+        n_test  = res$n_test,
+        test_sum_true = sum(res$test_true, na.rm=TRUE),
+        test_sum_pred = sum(res$test_pred, na.rm=TRUE),
+        test_rmse = rmse,
+        test_mape = mape,
+        unseen_sum_pred_h = sum(res$unseen_pred, na.rm=TRUE),
+        stringsAsFactors = FALSE
+      )
+      idx <- idx + 1L
+    }
+  }
+  do.call(rbind, out)
+}
+
+# ── OFFENSE eval + FF aggregates
+off_metric_cols <- c("pa","pc","py","ints","tdp","ra","ry","tdr","trg","rec","recy","tdrec","fum")
+eval_offense <- .evaluate_block(
+  df          = offense,
+  id_col      = "player",
+  season_col  = "GAME.seas",
+  week_col    = "GAME.wk",
+  metric_cols = off_metric_cols
+)
+
+FF_weights_off <- c(pa=0, pc=0, py=0, ints=-2.4, tdp=0, ra=6, ry=0.1, tdr=0.1, trg=6, rec=0, recy=0.1, tdrec=0.1, fum=-2)
+
+suppressWarnings({
+  wide_off_test <- reshape(eval_offense[, c("id","metric","test_sum_true")],
+                           idvar="id", timevar="metric", direction="wide")
+  names(wide_off_test) <- sub("^test_sum_true\\.", "", names(wide_off_test))
+  for (mm in setdiff(names(FF_weights_off), names(wide_off_test))) wide_off_test[[mm]] <- 0
+  wide_off_test$FF_test_true  <- as.numeric(as.matrix(wide_off_test[, names(FF_weights_off)]) %*% FF_weights_off)
+  
+  wide_off_pred <- reshape(eval_offense[, c("id","metric","test_sum_pred")],
+                           idvar="id", timevar="metric", direction="wide")
+  names(wide_off_pred) <- sub("^test_sum_pred\\.", "", names(wide_off_pred))
+  for (mm in setdiff(names(FF_weights_off), names(wide_off_pred))) wide_off_pred[[mm]] <- 0
+  wide_off_pred$FF_test_pred  <- as.numeric(as.matrix(wide_off_pred[, names(FF_weights_off)]) %*% FF_weights_off)
+  
+  wide_off_unseen <- reshape(eval_offense[, c("id","metric","unseen_sum_pred_h")],
+                             idvar="id", timevar="metric", direction="wide")
+  names(wide_off_unseen) <- sub("^unseen_sum_pred_h\\.", "", names(wide_off_unseen))
+  for (mm in setdiff(names(FF_weights_off), names(wide_off_unseen))) wide_off_unseen[[mm]] <- 0
+  wide_off_unseen$FF_unseen_pred_h <- as.numeric(as.matrix(wide_off_unseen[, names(FF_weights_off)]) %*% FF_weights_off)
+  
+  eval_offense <- merge(eval_offense, wide_off_test[, c("id","FF_test_true")], by="id", all.x=TRUE)
+  eval_offense <- merge(eval_offense, wide_off_pred[, c("id","FF_test_pred")], by="id", all.x=TRUE)
+  eval_offense <- merge(eval_offense, wide_off_unseen[, c("id","FF_unseen_pred_h")], by="id", all.x=TRUE)
+})
+write.csv(eval_offense, "eval_offense.csv", row.names = FALSE)
+
+# ── KICKERS eval + FF aggregates
+k_metric_cols <- c("PAT","FGS","FGM","FGL")
+eval_kickers <- .evaluate_block(
+  df          = kicking,
+  id_col      = "player",
+  season_col  = "GAME.seas",
+  week_col    = "GAME.wk",
+  metric_cols = k_metric_cols
+)
+FF_weights_k <- c(PAT=1, FGS=3, FGM=4, FGL=5)
+suppressWarnings({
+  w_test_k <- reshape(eval_kickers[, c("id","metric","test_sum_true")],
+                      idvar="id", timevar="metric", direction="wide")
+  names(w_test_k) <- sub("^test_sum_true\\.", "", names(w_test_k))
+  for (mm in setdiff(names(FF_weights_k), names(w_test_k))) w_test_k[[mm]] <- 0
+  w_test_k$FF_test_true <- as.numeric(as.matrix(w_test_k[, names(FF_weights_k)]) %*% FF_weights_k)
+  
+  w_pred_k <- reshape(eval_kickers[, c("id","metric","test_sum_pred")],
+                      idvar="id", timevar="metric", direction="wide")
+  names(w_pred_k) <- sub("^test_sum_pred\\.", "", names(w_pred_k))
+  for (mm in setdiff(names(FF_weights_k), names(w_pred_k))) w_pred_k[[mm]] <- 0
+  w_pred_k$FF_test_pred <- as.numeric(as.matrix(w_pred_k[, names(FF_weights_k)]) %*% FF_weights_k)
+  
+  w_unseen_k <- reshape(eval_kickers[, c("id","metric","unseen_sum_pred_h")],
+                        idvar="id", timevar="metric", direction="wide")
+  names(w_unseen_k) <- sub("^unseen_sum_pred_h\\.", "", names(w_unseen_k))
+  for (mm in setdiff(names(FF_weights_k), names(w_unseen_k))) w_unseen_k[[mm]] <- 0
+  w_unseen_k$FF_unseen_pred_h <- as.numeric(as.matrix(w_unseen_k[, names(FF_weights_k)]) %*% FF_weights_k)
+  
+  eval_kickers <- merge(eval_kickers, w_test_k[, c("id","FF_test_true")], by="id", all.x=TRUE)
+  eval_kickers <- merge(eval_kickers, w_pred_k[, c("id","FF_test_pred")], by="id", all.x=TRUE)
+  eval_kickers <- merge(eval_kickers, w_unseen_k[, c("id","FF_unseen_pred_h")], by="id", all.x=TRUE)
+})
+write.csv(eval_kickers, "eval_kickers.csv", row.names = FALSE)
+
+# ── DEFENSE eval
+def_metric_cols <- "DEFPTS"
+eval_defense <- .evaluate_block(
+  df          = defense,
+  id_col      = "team",
+  season_col  = "GAME.seas",
+  week_col    = "GAME.wk",
+  metric_cols = def_metric_cols
+)
+write.csv(eval_defense, "eval_defense.csv", row.names = FALSE)
+
+# ─────────────────────────────────────────────
 # TEST 2023 (OFFENSE) — keep structure, fast path (no re-forecasting)
 # ─────────────────────────────────────────────
 offense_2023 <- subset(offense, GAME.seas == 2023)
@@ -254,7 +439,6 @@ Forecast_offense_Test <- data.frame(
   pa=0, pc=0, py=0, ints=0, tdp=0, ra=0, ry=0, tdr=0, trg=0, rec=0, recy=0, tdrec=0, fum=0,
   FF=0, check.names = FALSE
 )
-# If you later add per-metric forecasts for 2023 here, reuse forecast_sum() and FF_weights_off.
 
 # Optional: team summary (not used elsewhere but kept for parity with your original)
 team_stats <- calculate_team_stats(seasons = season_range_off)
