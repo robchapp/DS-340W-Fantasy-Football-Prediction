@@ -223,122 +223,143 @@ offense <- transform(
   stringsAsFactors = FALSE
 )
 
-# Player filter: must have MIN_WEEKS rows; prefer recent activity implicitly
+# keep players with enough history
 offense$has_play <- rowSums(is.finite(as.matrix(offense[, c("pa","pc","py","ints","tdp","ra","ry","tdr","trg","rec","recy","tdrec","fum")]))) > 0
 weeks_by_player <- offense %>%
   group_by(player) %>%
   summarise(nw = sum(has_play, na.rm = TRUE), .groups = "drop") %>%
   filter(nw >= MIN_WEEKS) %>%
   arrange(desc(nw))
-
 if (is.finite(TOP_N_PLAYERS)) weeks_by_player <- head(weeks_by_player, TOP_N_PLAYERS)
-players_off   <- weeks_by_player$player
-nPlayers_off  <- length(players_off)
-message(sprintf("Offense players kept: %d", nPlayers_off))
+players_off  <- weeks_by_player$player
+nPlayers_off <- length(players_off)
+message(sprintf("Players kept: %d", nPlayers_off))
 
 # ────────────────────────────────────────────────────────────
-# ARIMAX forecaster (sum over horizon)
+# Robust + Fast ARIMAX (fixed model first, fallbacks)
 # ────────────────────────────────────────────────────────────
 forecast_sum_arimax <- function(y_vec, xreg_hist, xreg_fut, h) {
   y <- as.numeric(y_vec)
-  keep <- is.finite(y) & apply(is.finite(xreg_hist), 1, all)
-  y <- y[keep]
-  X <- xreg_hist[keep, , drop = FALSE]
+  if (length(y) < 2 || length(unique(na.omit(y))) < 2) {
+    mu <- mean(y, na.rm = TRUE); return(sum(rep(ifelse(is.finite(mu), mu, 0), h)))
+  }
+  row_keep <- is.finite(y) & apply(is.finite(xreg_hist), 1, all)
+  y  <- y[row_keep]
+  Xh <- xreg_hist[row_keep, , drop = FALSE]
+  Xf <- xreg_fut
   
-  if (length(y) < 2 || length(unique(y)) < 2) {
-    mu <- mean(y, na.rm = TRUE) %||% 0
-    return(sum(rep(mu, h)))
+  # drop zero-variance cols
+  keep_var <- apply(Xh, 2, function(col) sd(col, na.rm = TRUE) > 1e-9)
+  if (!any(keep_var)) {
+    fit0 <- try(auto.arima(y, approximation = TRUE, stepwise = TRUE,
+                           seasonal = ARIMA_SEASONAL, max.order = ARIMA_MAX_ORDER), silent = TRUE)
+    if (!inherits(fit0, "try-error")) {
+      fc0 <- forecast(fit0, h = h); return(sum(as.numeric(fc0$mean)))
+    }
+    mu <- mean(y, na.rm = TRUE); return(sum(rep(ifelse(is.finite(mu), mu, 0), h)))
+  }
+  Xh <- Xh[, keep_var, drop = FALSE]; Xf <- Xf[, keep_var, drop = FALSE]
+  
+  # full-rank via QR
+  qrh <- qr(Xh); piv <- qrh$pivot[seq_len(qrh$rank)]
+  Xh <- Xh[, piv, drop = FALSE]; Xf <- Xf[, piv, drop = FALSE]
+  
+  # scale columns using training stats
+  scale_cols <- function(A, center, scale) sweep(sweep(A, 2, center, `-`), 2, ifelse(scale == 0, 1, scale), `/`)
+  center <- colMeans(Xh); sds <- apply(Xh, 2, sd)
+  Xh <- scale_cols(Xh, center, sds); Xf <- scale_cols(Xf, center, sds)
+  
+  sum_fc <- function(fit, Xfuture = NULL) {
+    fc <- if (is.null(Xfuture)) forecast(fit, h = h) else forecast(fit, xreg = Xfuture, h = h)
+    sum(as.numeric(fc$mean))
   }
   
-  fit <- forecast::auto.arima(
-    y,
-    xreg          = X,
-    approximation = ARIMA_APPROX,
-    stepwise      = ARIMA_STEPWISE,
-    seasonal      = ARIMA_SEASONAL,
-    max.order     = ARIMA_MAX_ORDER
-  )
-  fc <- forecast::forecast(fit, xreg = xreg_fut, h = h)
-  sum(as.numeric(fc$mean))
+  # Try 1: cheap/sturdy fixed model first
+  fit1 <- try(Arima(y, order = c(0,1,1), xreg = Xh, include.mean = FALSE), silent = TRUE)
+  if (!inherits(fit1, "try-error")) return(sum_fc(fit1, Xf))
+  
+  # Try 2: light auto.arima
+  fit2 <- try(auto.arima(y, xreg = Xh,
+                         approximation = ARIMA_APPROX, stepwise = ARIMA_STEPWISE,
+                         seasonal = ARIMA_SEASONAL, max.order = ARIMA_MAX_ORDER), silent = TRUE)
+  if (!inherits(fit2, "try-error")) return(sum_fc(fit2, Xf))
+  
+  # Try 3 (optional heavy search) — uncomment if you need it:
+  # fit3 <- try(auto.arima(y, xreg = Xh,
+  #                        approximation = FALSE, stepwise = FALSE,
+  #                        seasonal = ARIMA_SEASONAL, max.order = max(10, ARIMA_MAX_ORDER)), silent = TRUE)
+  # if (!inherits(fit3, "try-error")) return(sum_fc(fit3, Xf))
+  
+  # Try 4: plain ARIMA
+  fit4 <- try(auto.arima(y, approximation = TRUE, stepwise = TRUE,
+                         seasonal = ARIMA_SEASONAL, max.order = ARIMA_MAX_ORDER), silent = TRUE)
+  if (!inherits(fit4, "try-error")) return(sum_fc(fit4))
+  
+  # Final fallback: mean
+  mu <- mean(y, na.rm = TRUE); sum(rep(ifelse(is.finite(mu), mu, 0), h))
 }
 
 # ────────────────────────────────────────────────────────────
-# OFFENSE projections with ARIMAX
+# Offense projections (parallel)
 # ────────────────────────────────────────────────────────────
 off_metric_cols <- c("pa","pc","py","ints","tdp","ra","ry","tdr","trg","rec","recy","tdrec","fum")
+FF_weights_off <- c(pa=0, pc=0, py=0, ints=-2.4, tdp=0, ra=6.0, ry=0.1, tdr=0.1,
+                    trg=6.0, rec=0.0, recy=0.1, tdrec=0.1, fum=-2.0)
 
-# Fantasy weights (example; adjust to your scoring)
-FF_weights_off <- c(
-  pa=0, pc=0, py=0, ints=-2.4, tdp=0,
-  ra=6.0, ry=0.1, tdr=0.1, trg=6.0, rec=0.0,
-  recy=0.1, tdrec=0.1, fum=-2.0
-)
-
-Forecast_offense <- as.data.frame(matrix(0, nrow = nPlayers_off, ncol = length(off_metric_cols) + 4))
-colnames(Forecast_offense) <- c("player", "TEAM", off_metric_cols, "FF")
-Forecast_offense$player <- as.character(players_off)
-
-for (i in seq_len(nPlayers_off)) {
+rows <- future_lapply(seq_len(nPlayers_off), function(i) {
   pid <- players_off[i]
   pdata <- offense %>% filter(player == pid) %>% arrange(GAME.seas, GAME.wk)
+  if (!nrow(pdata)) return(NULL)
   
-  if (nrow(pdata) == 0) next
-  
-  # Join team-week context for historical xreg
   xctx <- pdata %>%
     left_join(
       team_week,
-      by = c("GAME.seas" = "season",
-             "GAME.wk"   = "week",
-             "TEAM"      = "team")
+      by = c("GAME.seas" = "season", "GAME.wk" = "week", "TEAM" = "team")
     ) %>%
     mutate(
-      is_home       = tidyr::replace_na(is_home, 0L),
-      roof          = factor(tidyr::replace_na(as.character(roof), "outdoors"), levels = lvl_ref$roof),
-      surface       = factor(tidyr::replace_na(as.character(surface), "grass"),    levels = lvl_ref$surface),
-      weather       = factor(tidyr::replace_na(as.character(weather), "unknown"),  levels = lvl_ref$weather),
-      team          = factor(tidyr::replace_na(as.character(TEAM), levels(team_week$team)[1]), levels = lvl_ref$team),
-      rush_attempts = tidyr::replace_na(rush_attempts, 25),
-      pass_attempts = tidyr::replace_na(pass_attempts, 30)
+      is_home       = replace_na(is_home, 0L),
+      roof          = replace_na(roof, "outdoor"),
+      surface       = replace_na(surface, "grass"),
+      weather       = replace_na(weather, "unknown"),
+      rush_attempts = replace_na(rush_attempts, 25),
+      pass_attempts = replace_na(pass_attempts, 30)
     )
   
   X_hist <- make_xreg(xctx, lvl_ref)
-  
-  # Build future xreg from schedule + tendencies
   last_season <- tail(pdata$GAME.seas, 1)
   last_week   <- tail(pdata$GAME.wk,   1)
   team_id     <- as.character(tail(pdata$TEAM, 1) %||% NA_character_)
   
-  if (!is.na(team_id) && team_id %in% lvl_ref$team) {
+  if (!is.na(team_id)) {
     X_fut <- build_future_xreg(team_id, last_season, last_week, FORECAST_H, team_week, team_roll, lvl_ref)
   } else {
-    # fallback to zero-matrix of correct width
-    X_fut <- matrix(0, nrow = FORECAST_H, ncol = ncol(X_hist))
-    colnames(X_fut) <- colnames(X_hist)
+    # zero-matrix of correct width
+    stub <- data.frame(is_home=0, roof="outdoor", surface="grass",
+                       weather="unknown", rush_attempts=0, pass_attempts=0)
+    mm   <- make_xreg(stub, lvl_ref)
+    X_fut <- matrix(0, nrow = FORECAST_H, ncol = ncol(mm)); colnames(X_fut) <- colnames(mm)
   }
   
-  # Per-metric ARIMAX forecasts
-  for (m in off_metric_cols) {
-    Forecast_offense[i, m] <- forecast_sum_arimax(
-      y_vec    = pdata[[m]],
-      xreg_hist= X_hist,
-      xreg_fut = X_fut,
-      h        = FORECAST_H
-    )
-  }
+  vals <- vapply(off_metric_cols, function(m) {
+    forecast_sum_arimax(pdata[[m]], X_hist, X_fut, FORECAST_H)
+  }, numeric(1))
   
-  Forecast_offense$TEAM[i] <- tail(pdata$TEAM, 1) %||% NA_character_
-  vals <- as.numeric(Forecast_offense[i, off_metric_cols])
-  Forecast_offense$FF[i] <- sum(vals * FF_weights_off[off_metric_cols], na.rm = TRUE)
+  FF <- sum(vals * FF_weights_off[off_metric_cols], na.rm = TRUE)
+  c(player = pid, TEAM = tail(pdata$TEAM, 1) %||% NA_character_, vals, FF = FF)
+})
+
+Forecast_offense <- do.call(rbind, rows) |> as.data.frame(check.names = FALSE)
+# type cleanup
+for (nm in intersect(colnames(Forecast_offense), off_metric_cols)) {
+  Forecast_offense[[nm]] <- as.numeric(Forecast_offense[[nm]])
 }
+Forecast_offense$FF   <- as.numeric(Forecast_offense$FF)
+Forecast_offense$TEAM <- as.character(Forecast_offense$TEAM)
+Forecast_offense$player <- as.character(Forecast_offense$player)
 
-# Sort & write output
-Forecast_offense_ranked <- Forecast_offense %>%
-  arrange(desc(FF))
+Forecast_offense_ranked <- Forecast_offense %>% arrange(desc(FF))
 
-out_file <- "forecast_offense_arimax.csv"
-readr::write_csv(Forecast_offense_ranked, out_file)
+out_file <- "forecast_offense_arimax_fast.csv"
+write_csv(Forecast_offense_ranked, out_file)
 message(sprintf("Wrote %s with %d players.", out_file, nrow(Forecast_offense_ranked)))
-
-# Top preview
 print(utils::head(Forecast_offense_ranked, 20))
