@@ -1,37 +1,35 @@
 # ============================================================
-# End-to-end: ARIMAX fantasy projections with game-context xregs
+# Fast ARIMAX Fantasy Projections with Context xregs (End-to-End)
 # ============================================================
 
 # ────────────────────────────────────────────────────────────
-# Controls (tune these)
+# Controls (speed-tuned)
 # ────────────────────────────────────────────────────────────
 FAST_MODE         <- TRUE
-SEASONS_BACK      <- if (FAST_MODE) 3 else 26     # last N completed seasons
-MIN_WEEKS         <- if (FAST_MODE) 8 else 2      # min rows per player
-TOP_N_PLAYERS     <- if (FAST_MODE) 600 else Inf  # player cap
-FORECAST_H        <- if (FAST_MODE) 8 else 16     # weeks to project
+SEASONS_BACK      <- 2                  # ↓ was 3
+MIN_WEEKS         <- 10                 # ↓ avoid tiny series
+TOP_N_PLAYERS     <- 300                # ↓ was 600
+FORECAST_H        <- 6                  # ↓ was 8
 
-# ARIMA knobs
+# ARIMA knobs (smaller search)
 ARIMA_APPROX      <- TRUE
 ARIMA_STEPWISE    <- TRUE
 ARIMA_SEASONAL    <- FALSE
-ARIMA_MAX_ORDER   <- 5
+ARIMA_MAX_ORDER   <- 3                  # ↓ was 5
 
 # ────────────────────────────────────────────────────────────
 # Packages
 # ────────────────────────────────────────────────────────────
 suppressPackageStartupMessages({
-  library(dplyr)
-  library(tidyr)
-  library(stringr)
-  library(forecast)
-  library(nflfastR)
-  library(nflreadr)
-  library(zoo)        # for rollapplyr
-  library(readr)
+  library(dplyr);  library(tidyr);  library(stringr)
+  library(forecast); library(nflfastR); library(nflreadr)
+  library(zoo);    library(readr)
+  library(future); library(future.apply)
 })
 
-# Null-coalescing helper
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+
+# helpers
 `%||%` <- function(x, y) if (!is.null(x)) x else y
 
 # ────────────────────────────────────────────────────────────
@@ -39,24 +37,39 @@ suppressPackageStartupMessages({
 # ────────────────────────────────────────────────────────────
 most <- nflreadr::most_recent_season()
 start_season <- max(1999, most - SEASONS_BACK + 1)
-end_season   <- most - 1                          # last completed
+end_season   <- most - 1
 season_range_off <- start_season:end_season
-
-message(sprintf("Seasons (offense): %d-%d", start_season, end_season))
+message(sprintf("Seasons used: %d–%d", start_season, end_season))
 
 # ────────────────────────────────────────────────────────────
-# Build TEAM-WEEK features from PBP (context variables)
+# Feature engineering (team-week context)
 # ────────────────────────────────────────────────────────────
 bucket_weather <- function(x) {
-  x <- tolower(as.character(x))
-  x[is.na(x) | x==""] <- "unknown"
-  dplyr::case_when(
+  x <- tolower(as.character(x)); x[is.na(x) | x==""] <- "unknown"
+  case_when(
     str_detect(x, "rain|shower|drizzle") ~ "rain",
     str_detect(x, "snow|flurr")          ~ "snow",
     str_detect(x, "wind")                ~ "windy",
     str_detect(x, "overcast|cloud")      ~ "cloudy",
     str_detect(x, "sun|clear|fair")      ~ "clear",
     TRUE                                 ~ "unknown"
+  )
+}
+
+norm_roof <- function(x) {
+  x <- tolower(as.character(x))
+  case_when(
+    str_detect(x, "indoor|dome|closed") ~ "indoor",
+    TRUE                                ~ "outdoor"
+  )
+}
+
+norm_surface <- function(x) {
+  x <- tolower(as.character(x))
+  case_when(
+    str_detect(x, "turf|artificial") ~ "turf",
+    str_detect(x, "grass")           ~ "grass",
+    TRUE                             ~ "other"
   )
 }
 
@@ -69,11 +82,11 @@ build_teamweek_features <- function(seasons) {
     summarise(
       rush_attempts = sum(rush_attempt %in% c(1, TRUE), na.rm = TRUE),
       pass_attempts = sum(pass_attempt %in% c(1, TRUE), na.rm = TRUE),
-      roof    = dplyr::first(na.omit(roof)),
-      surface = dplyr::first(na.omit(surface)),
-      weather = bucket_weather(dplyr::first(na.omit(weather))),
-      home_team = dplyr::first(na.omit(home_team)),
-      away_team = dplyr::first(na.omit(away_team)),
+      roof    = norm_roof(first(na.omit(roof))),
+      surface = norm_surface(first(na.omit(surface))),
+      weather = bucket_weather(first(na.omit(weather))),
+      home_team = first(na.omit(home_team)),
+      away_team = first(na.omit(away_team)),
       .groups = "drop"
     ) %>%
     mutate(
@@ -84,17 +97,14 @@ build_teamweek_features <- function(seasons) {
            home_team, away_team, is_home, roof, surface, weather,
            rush_attempts, pass_attempts)
   
-  # Rolling tendencies to seed future xreg (per team)
   team_roll <- team_week %>%
     arrange(team, season, week) %>%
     group_by(team) %>%
     mutate(
       rush_share = rush_attempts / pmax(1, rush_attempts + pass_attempts),
       pass_share = 1 - rush_share,
-      rush_share_rm      = dplyr::lag(zoo::rollapplyr(rush_share, 5, mean, na.rm = TRUE, partial = TRUE)),
-      pass_share_rm      = dplyr::lag(zoo::rollapplyr(pass_share, 5, mean, na.rm = TRUE, partial = TRUE)),
-      rush_attempts_rm   = dplyr::lag(zoo::rollapplyr(rush_attempts, 5, mean, na.rm = TRUE, partial = TRUE)),
-      pass_attempts_rm   = dplyr::lag(zoo::rollapplyr(pass_attempts, 5, mean, na.rm = TRUE, partial = TRUE))
+      rush_attempts_rm = lag(rollapplyr(rush_attempts, 5, mean, na.rm = TRUE, partial = TRUE)),
+      pass_attempts_rm = lag(rollapplyr(pass_attempts, 5, mean, na.rm = TRUE, partial = TRUE))
     ) %>%
     ungroup()
   
@@ -105,94 +115,82 @@ feat <- build_teamweek_features(season_range_off)
 team_week <- feat$team_week
 team_roll <- feat$team_roll
 
-# Normalize factor levels so hist/future matrices align
-team_week$roof    <- factor(team_week$roof %||% "outdoors")
-team_week$surface <- factor(team_week$surface %||% "grass")
-team_week$weather <- factor(team_week$weather %||% "unknown")
-team_week$team    <- factor(team_week$team)
-
-# ────────────────────────────────────────────────────────────
-# Build FUTURE xreg from schedule + recent team tendencies
-# ────────────────────────────────────────────────────────────
-make_xreg <- function(df, lvl_ref = NULL) {
-  # df must contain: is_home, roof, surface, weather, rush_attempts, pass_attempts, team
-  # Keep team fixed effects for stability
-  f <- ~ is_home + roof + surface + weather + rush_attempts + pass_attempts + team
-  if (!is.null(lvl_ref)) {
-    df$roof    <- factor(as.character(df$roof),    levels = lvl_ref$roof)
-    df$surface <- factor(as.character(df$surface), levels = lvl_ref$surface)
-    df$weather <- factor(as.character(df$weather), levels = lvl_ref$weather)
-    df$team    <- factor(as.character(df$team),    levels = lvl_ref$team)
-  }
-  mm <- model.matrix(f, data = df)
-  storage.mode(mm) <- "double"
-  mm
-}
+# stable factor levels for HIST/FUT design matrices
+team_week$roof    <- factor(team_week$roof,    levels = c("indoor","outdoor"))
+team_week$surface <- factor(team_week$surface, levels = c("grass","turf","other"))
+team_week$weather <- factor(team_week$weather, levels = c("clear","cloudy","rain","snow","windy","unknown"))
 
 lvl_ref <- list(
   roof    = levels(team_week$roof),
   surface = levels(team_week$surface),
-  weather = levels(team_week$weather),
-  team    = levels(team_week$team)
+  weather = levels(team_week$weather)
 )
+
+# ────────────────────────────────────────────────────────────
+# xreg builders (NO team fixed effects → faster, stabler)
+# ────────────────────────────────────────────────────────────
+make_xreg <- function(df, lvl_ref) {
+  df$roof    <- factor(norm_roof(df$roof),    levels = lvl_ref$roof)
+  df$surface <- factor(norm_surface(df$surface), levels = lvl_ref$surface)
+  df$weather <- factor(bucket_weather(df$weather), levels = lvl_ref$weather)
+  
+  # lean formula (no team FE)
+  mm <- model.matrix(~ is_home + roof + surface + weather +
+                       rush_attempts + pass_attempts, data = df)
+  storage.mode(mm) <- "double"
+  mm
+}
+
+# FUTURE xreg cache
+xreg_fut_cache <- new.env(parent = emptyenv())
 
 build_future_xreg <- function(team_id, start_season, start_week, horizon,
                               team_week, team_roll, lvl_ref) {
-  # Use current (in-progress) season schedule to plan future games
+  key <- paste(team_id, start_season, start_week, horizon, sep = "_")
+  if (exists(key, envir = xreg_fut_cache)) return(get(key, envir = xreg_fut_cache))
+  
   sched <- nflreadr::load_schedules(most) %>%
-    transmute(season, week, game_id, home_team, away_team, roof, surface)
+    transmute(season, week, game_id, home_team, away_team, roof = norm_roof(roof), surface = norm_surface(surface))
   
   fut <- sched %>%
-    filter( (season > start_season) | (season == start_season & week > start_week) ) %>%
+    filter((season > start_season) | (season == start_season & week > start_week)) %>%
     arrange(season, week) %>%
     mutate(my_team = if_else(home_team == team_id, home_team,
                              if_else(away_team == team_id, away_team, NA_character_))) %>%
     filter(!is.na(my_team)) %>%
     mutate(
-      team    = my_team,
-      is_home = if_else(team == home_team, 1L, 0L),
-      weather = "unknown"  # no future weather here
+      is_home = if_else(my_team == home_team, 1L, 0L),
+      weather = "unknown"
     ) %>%
     head(horizon)
   
   if (nrow(fut) == 0) {
-    # No remaining games; return zeros of correct width
-    stub <- data.frame(
-      is_home=0, roof=factor("outdoors", levels=lvl_ref$roof),
-      surface=factor("grass", levels=lvl_ref$surface),
-      weather=factor("unknown", levels=lvl_ref$weather),
-      rush_attempts=0, pass_attempts=0,
-      team=factor(team_id, levels=lvl_ref$team)
-    )
-    mm <- make_xreg(stub, lvl_ref)
-    mm0 <- matrix(0, nrow = horizon, ncol = ncol(mm))
-    colnames(mm0) <- colnames(mm)
-    return(mm0)
+    # return zero matrix with right columns
+    stub <- data.frame(is_home=0, roof="outdoor", surface="grass",
+                       weather="unknown", rush_attempts=0, pass_attempts=0)
+    mm   <- make_xreg(stub, lvl_ref)
+    mm0  <- matrix(0, nrow = horizon, ncol = ncol(mm)); colnames(mm0) <- colnames(mm)
+    assign(key, mm0, envir = xreg_fut_cache); return(mm0)
   }
   
-  # last rolling tendencies for this team
-  last_roll <- team_roll %>%
-    filter(team == team_id) %>%
-    arrange(season, week) %>%
-    slice_tail(n = 1)
+  last_roll <- team_roll %>% filter(team == team_id) %>%
+    arrange(season, week) %>% slice_tail(n = 1)
   
   ra_rm <- last_roll$rush_attempts_rm %||% 25
   pa_rm <- last_roll$pass_attempts_rm %||% 30
   
-  fut2 <- fut %>%
-    transmute(
-      is_home,
-      roof, surface, weather,
-      rush_attempts = ra_rm,
-      pass_attempts = pa_rm,
-      team
-    )
+  fut2 <- fut %>% transmute(
+    is_home, roof, surface, weather,
+    rush_attempts = ra_rm, pass_attempts = pa_rm
+  )
   
-  make_xreg(fut2, lvl_ref)
+  Xf <- make_xreg(fut2, lvl_ref)
+  assign(key, Xf, envir = xreg_fut_cache)
+  Xf
 }
 
 # ────────────────────────────────────────────────────────────
-# OFFENSE: build weekly player table
+# Load offense data (weekly player stats)
 # ────────────────────────────────────────────────────────────
 off_raw <- nflreadr::load_player_stats(seasons = season_range_off)
 
@@ -208,7 +206,6 @@ offense <- transform(
     POS       = off_raw[["position"]] %||% NA_character_,
     GAME.seas = off_raw[["season"]],
     GAME.wk   = off_raw[["week"]],
-    # stable metric names
     pa    = off_raw[["passing_attempts"]]    %||% off_raw[["attempts"]]               %||% 0,
     pc    = off_raw[["passing_completions"]] %||% off_raw[["completions"]]            %||% 0,
     py    = off_raw[["passing_yards"]]       %||% off_raw[["pass_yards"]]             %||% 0,
