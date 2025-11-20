@@ -49,15 +49,6 @@ The project focuses on **QB/RB/WR/TE/K/DEF** fantasy scoring and evaluates model
   - Compares performance head-to-head across players and weeks.
   - Useful for isolating the effect of adding non-linear structure (NN) vs linear ARIMAX.
 
-- `DS340W_scratchwork.R`  
-  Scratch / exploratory script:
-  - Ad-hoc analysis.
-  - Prototype code snippets, feature engineering ideas, etc.
-
-- `Tempcode_DS340W.R`  
-  Temporary experimentation script:
-  - Extra tests, debugging, or quick model variants that did not make it into the main pipeline.
-
 **Data & outputs**
 
 - `cleaned_fantasy_football_data.xlsx`  
