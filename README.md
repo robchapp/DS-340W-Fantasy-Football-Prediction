@@ -76,5 +76,4 @@ The project focuses on **QB/RB/WR/TE/K/DEF** fantasy scoring and evaluates model
 
   These contain model predictions by player and week for different model variants.
 
-- Backtest summary files:
-  - `backtes
+
