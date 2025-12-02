@@ -10,6 +10,8 @@ The core goal is to build **player-level weekly fantasy projections** and compar
 
 The project focuses on **QB/RB/WR/TE/K/DEF** fantasy scoring and evaluates models using historical data and backtesting.
 
+To view only player specific results run the Code files. To see comparison statistics and player results run `ARIMA_ARIMAX_NN_340W_Comparison.R`
+
 Our original Parent Paper code is the **Univariate ARIMA** file. Our Innovations are the **ARIMAX** and **Neural network time-series models**. We created a comparison file that we use to determine the true results as our predictions are relatively the same between each group.
 ---
 
